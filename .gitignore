@@ -1,0 +1,49 @@
+# BELFERO — backend (Express + Prisma + TypeScript)
+
+# === SEKRETY ===
+# .env trzyma DATABASE_URL, JWT_SECRET, klucze Anthropic/OpenAI/Google, hasło do HostedSMS
+# i sekret Turnstile. Wersja z `.example` jest po to, żeby repo znało kształt, nie wartości.
+.env
+.env.*
+!.env.example
+
+# === DANE UCZNIÓW ===
+# Zanonimizowane skany prac. Zamalowanie nazwiska nie czyni z pliku danych neutralnych —
+# to nadal materiały do dziennika, więc nie opuszczają tego dysku.
+uploads/
+# Migawki z testów orientacji i walidacji prostokąta.
+tmp/
+
+# === BUILD ===
+dist/
+*.tsbuildinfo
+
+# === ZALEŻNOŚCI ===
+node_modules/
+
+# === LOGI ===
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# === EDYTOR ===
+# WebStorm dorzuca .idea tam, gdzie otworzy projekt, więc wzorzec jest w obu katalogach.
+.idea/
+.vscode/
+!.vscode/extensions.json
+
+# === INSTALOWANE ZESTAWY SKILLI ===
+# Pobrane z zewnątrz dokumentacje Prisma, nie kod tego projektu.
+.agents/
+.claude/
+.cursor/
+.devin/
+
+# === SYSTEM ===
+.DS_Store
+Thumbs.db
+
+# Świadomie BEZ wzorców na pliki SQL: prisma/migrations/**/migration.sql jest częścią repo
+# i bez niego nowe środowisko nie odtworzy schematu.

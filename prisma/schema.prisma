@@ -1,0 +1,377 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// USER MODEL - Authentication & Subscription
+// ============================================
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String   // bcrypt hash
+
+  // Zero-Knowledge Encryption
+  encryption_salt String   // Salt używany do generowania klucza szyfrującego z hasła
+
+  // Profil i preferencje — jedyna część konta, którą nauczyciel zmienia sam (PATCH /api/account)
+  display_name String? // Imię i nazwisko; dopóki puste, nagłówki pokazują adres email
+  low_balance_alert_threshold Int @default(50) // Poniżej tylu stron pulpit i portfel upominają się o doładowanie
+
+  // Jak uczniowie trafiają do grup wariantów: "manual" (nauczyciel przypina sam) albo "ai".
+  // String, nie enum: ta sama droga co subscription_tier, a dodanie trybu nie wymaga migracji typu.
+  group_assignment_mode String @default("manual")
+
+  // Subscription & Limits
+  pages_current_limit   Int      @default(350)  // Aktualny limit stron w bieżącym okresie
+  pages_total_processed Int      @default(0)    // Całkowita liczba przetworzonych stron (licznik życia)
+  subscription_tier     String   @default("free") // free, basic, premium
+  subscription_ends_at  DateTime?
+
+  // Password Reset
+  reset_token           String?   @unique
+  reset_token_expires   DateTime?
+
+  // Weryfikacja adresu email
+  email_verified_at           DateTime?
+  verification_token          String?   @unique
+  verification_token_expires  DateTime?
+  verification_sent_at        DateTime?
+
+  // Weryfikacja numeru telefonu (hamuje zakładanie wielu kont po to, by mnożyć darmowy limit stron).
+  // Numer jest W SWOJEJ POSTACI, nie hashem: unikalność ma być wyznacznikiem tożsamości właściciela,
+  // a bez soli hash i tak dałby się odwrócić słownikiem (przestrzeń polskiego numeru to ~10^9).
+  // Nullable, więc wielość kont bez numeru (np. założone przed tą zmianą) nie zderza się na @unique.
+  phone             String?   @unique
+  is_phone_verified Boolean   @default(false)
+
+  // Kod SMS zostaje w plain text celowo: żyje 5 minut, ma limit 5 prób i nigdy nie wraca w odpowiedzi.
+  // Haszowanie uniemożliwiłoby porównanie timingSafeEqual bez dodatkowego odczytu soli.
+  sms_code          String?
+  sms_code_expires  DateTime?
+  sms_code_sent_at  DateTime? // cooldown 60 s w bazie, a nie w pamięci procesu — restart nie daje nowej serii kodów
+  sms_code_attempts Int       @default(0)
+
+  // Timestamps
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  classes          Class[]
+  grading_sessions GradingSession[]
+  grade_thresholds GradeThreshold[]
+  answer_keys      AnswerKey[]
+
+  // Domyślna skala w kreatorze sprawdzania. SetNull: usunięcie skali zostawia konto działające,
+  // tylko wybór wraca do „bez progów ocen".
+  default_grade_threshold_id String?
+  default_grade_threshold    GradeThreshold? @relation("UserDefaultGradeThreshold", fields: [default_grade_threshold_id], references: [id], onDelete: SetNull)
+
+  @@index([default_grade_threshold_id])
+
+  @@map("users")
+}
+
+// ============================================
+// CLASS MODEL - Klasy nauczyciela
+// ============================================
+model Class {
+  id         String   @id @default(uuid())
+  user_id    String
+
+  // Encrypted fields (szyfrowane po stronie klienta)
+  encrypted_name String   // Zaszyfrowana nazwa klasy (np. "Klasa 3A")
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  user      User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  students  Student[]
+  grading_sessions GradingSession[]
+
+  @@index([user_id])
+  @@map("classes")
+}
+
+// ============================================
+// STUDENT MODEL - Uczniowie (Zero-Knowledge)
+// ============================================
+model Student {
+  id       String @id @default(uuid())
+  class_id String
+
+  // Encrypted fields (WSZYSTKIE dane osobowe szyfrowane)
+  encrypted_first_name String  // Zaszyfrowane imię
+  encrypted_last_name  String  // Zaszyfrowane nazwisko
+  encrypted_number     String  // Zaszyfrowany numer z dziennika
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  class  Class  @relation(fields: [class_id], references: [id], onDelete: Cascade)
+  grades Grade[]
+
+  @@index([class_id])
+  @@map("students")
+}
+
+// ============================================
+// GRADING SESSION - Sesja sprawdzania
+// ============================================
+model GradingSession {
+  id       String @id @default(uuid())
+  user_id  String
+  class_id String
+
+  // Nazwa dla historii: kopiowana z nazwy klucza odpowiedzi w chwili tworzenia sesji, więc późniejsza
+  // edycja klucza w bibliotece nie zmienia już sprawdzonych sesji. Unikalność w obrębie nauczyciela
+  // zapewnia kod (przyrostki _2, _3), nie baza — dwa create w tym samym ułamku sekundy nie mogą zwrócić 500.
+  name String?
+
+  // Answer Key (klucz odpowiedzi)
+  answer_key Json    // { tasks: [{id, max_points, correct_answer, guidelines, sub_items?}], total_points }
+
+  // Grade Threshold (progi ocen)
+  grade_threshold_id String?
+
+  // Answer Key z biblioteki (proweniencja; `answer_key` wyżej to snapshot treści z chwili tworzenia sesji)
+  answer_key_id String?
+
+  // Uczniowie, którzy nie pisali sprawdzianu (nieobecność). Same UUID uczniów — zero-knowledge
+  // pozostaje nienaruszone, bo lista nie niesie żadnego imienia ani numeru z dziennika.
+  absent_student_ids Json?
+
+  // Jak praca dostaje swój wariant: 'manual' = nauczyciel przypisał uczniów do grup (są wiersze w
+  // grading_session_groups niżej), 'ai' = nikt nie przydzielał, a wariant pracy rozpoznaje model z jej
+  // treści podczas oceny. Snapshot z chwili tworzenia, nie wskazanie na users.group_assignment_mode:
+  // ustawienie konta zmienia się dowolnie, a już utworzona sesja musi pozostać taka, jaka była.
+  group_assignment_mode String @default("manual")
+
+  // [{ name, position, answer_key: { tasks, total_points } }] — warianty do rozpoznawania, tylko dla
+  // sesji 'ai'. Ta sesja NIE ma wierszy w grading_session_groups, bo członkostwa nie ma kto zapisać,
+  // a mianownikiem brakujących prac wraca na „klasa minus nieobecni". Treść zamrażamy zamiast czytać
+  // answer_key_groups po answer_key_id: edycja klucza w bibliotece nie może ruszyć już sprawdzanych prac.
+  answer_key_variants Json?
+
+  // Status
+  // awaiting_works = AI sprawdziło to, co wpłynęło, ale w klasie zostały uczniowie bez pracy i bez
+  // oznaczonej nieobecności. Sesja wraca tu po "Zakończ bez reszty", nie po błędzie przetwarzania.
+  status String @default("in_progress") // in_progress, processing, completed, awaiting_works, archived
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  user            User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  class           Class            @relation(fields: [class_id], references: [id], onDelete: Cascade)
+  grade_threshold GradeThreshold?  @relation(fields: [grade_threshold_id], references: [id], onDelete: SetNull)
+  answer_key_ref  AnswerKey?       @relation(fields: [answer_key_id], references: [id], onDelete: SetNull)
+  grades          Grade[]
+  session_groups  GradingSessionGroup[]
+
+  @@index([user_id])
+  @@index([class_id])
+  @@index([grade_threshold_id])
+  @@index([answer_key_id])
+  @@index([user_id, name])
+  @@map("grading_sessions")
+}
+
+// ============================================
+// GRADING SESSION GROUP - Grupa wewnątrz jednej sesji (warianty A, B, C)
+// ============================================
+// Nauczyciel dzieli klasę na grupy, żeby uczniowie nie ściągali: każda grupa dostaje własny klucz
+// odpowiedzi, a więc i własny mianownik procentów. Grupa żyje WYŁĄCZNIE w swojej sesji i jest jej
+// zamrożoną kopią — dokładnie tak jak answer_key i name na GradingSession. Dlatego nie ma tu relacji
+// do klasy ani do Student: późniejsza zmiana składu klasy nie może przerobić już sprawdzonych prac.
+model GradingSessionGroup {
+  id         String @id @default(uuid())
+  session_id String
+
+  // Kolejność na ekranie i w PDF (0, 1, 2...). Grupę po usunięciu jednej nie przeliczamy — służy
+  // tylko ustawieniu porządku, więc dziury są nieszkodliwe.
+  position Int
+
+  // Etykieta wymyślona przez nauczyciela („Grupa A"). To NIE jest dane ucznia, więc plaintext,
+  // tak jak name na GradingSession. Brak @@unique celowo: dwa create w tym samym ułamku sekundy
+  // nie mogą zwrócić 500, a duplikaty są nieszkodliwe (patrz komentarz przy GradingSession.name).
+  name String
+
+  // Snapshot klucza tej grupy: { tasks: [{id, max_points, correct_answer, guidelines, sub_items?}], total_points }.
+  // To stąd /process czyta klucz dla pracy ucznia, nie z answer_key sesji.
+  answer_key Json
+
+  // Proweniencja klucza z biblioteki; treść i tak jest zamrożona wyżej.
+  answer_key_id String?
+
+  // Same UUID uczniów tej grupy — zero-knowledge pozostaje nienaruszone, bo lista nie niesie
+  // żadnego imienia ani numeru z dziennika. Unia tych list jest mianownikiem „brak pracy".
+  student_ids Json
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  grading_session GradingSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  answer_key_ref  AnswerKey?     @relation(fields: [answer_key_id], references: [id], onDelete: SetNull)
+
+  @@index([session_id])
+  @@index([session_id, position])
+  @@index([answer_key_id])
+  @@map("grading_session_groups")
+}
+
+// ============================================
+// GRADE THRESHOLD - Progi ocen
+// ============================================
+model GradeThreshold {
+  id         String   @id @default(uuid())
+  user_id    String
+  name       String
+  thresholds Json     // [{ grade: "5", min_percent: 90 }, ...] posortowane MALEJĄCO po min_percent
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  user             User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  grading_sessions GradingSession[]
+
+  // Konta, dla których ta skala jest domyślnym wyborem w kreatorze (User.default_grade_threshold_id)
+  default_for_users User[] @relation("UserDefaultGradeThreshold")
+
+  @@index([user_id])
+  @@map("grade_thresholds")
+}
+
+// ============================================
+// ANSWER KEY - Klucz odpowiedzi z biblioteki
+// ============================================
+model AnswerKey {
+  id           String   @id @default(uuid())
+  user_id      String
+  name         String
+  subject      String?
+
+  // { tasks: [{id, max_points, correct_answer, guidelines, sub_items?: [{id, max_points, correct_answer}]}], total_points }
+  // `sub_items` jest opcjonalne i dotyczy zadań z podpunktami (a, b, c...). Wtedy `max_points`
+  // zadania to suma punktów podpunktów, liczona po stronie serwera — nigdy wartość wpisana.
+  tasks        Json     // posortowane naturalnie po `id`
+  total_points Float    // suma max_points, liczona po stronie serwera
+
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  // Relations
+  user             User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  grading_sessions GradingSession[]
+  grading_session_groups GradingSessionGroup[]
+  answer_key_groups AnswerKeyGroup[]
+
+  @@index([user_id])
+  @@map("answer_keys")
+}
+
+// ============================================
+// ANSWER KEY GROUP - Wariant zadań wewnątrz klucza odpowiedzi
+// ============================================
+// Nauczyciel tworzy warianty („Grupa A", „Grupa B") już przy budowaniu klucza, żeby w kreatorze
+// sprawdzania zostać tylko przy przypisaniu uczniów. Klucz NIE jest tu daną ucznia — etykiety są
+// wymyślone przez nauczyciela, więc plaintext, tak jak name na GradingSession.
+// answer_keys.tasks / total_points pozostają wypełnione wariantem zerowym: wszystkie istniejące
+// odczyty (mianownik procentów, historia, /process bez grup) czytają właśnie je.
+model AnswerKeyGroup {
+  id            String @id @default(uuid())
+  answer_key_id String
+
+  // Kolejność na ekranie i w PDF (0, 1, 2...). Po usunięciu wariantu nie przeliczamy — dziury są nieszkodliwe.
+  position Int
+
+  // Etykieta wariantu wymyślona przez nauczyciela. Brak @@unique celowo: dwa create w tym samym
+  // ułamku sekundy nie mogą zwrócić 500, a duplikat nazwy jest nieszkodliwy.
+  name String
+
+  // Tablica zadań tego wariantu, ten sam kształt co `answer_keys.tasks`:
+  // [{id, max_points, correct_answer, guidelines, sub_items?: [{id, max_points, correct_answer}]}]
+  tasks        Json
+  total_points Float // suma max_points tego wariantu, liczona po stronie serwera
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  answer_key             AnswerKey               @relation(fields: [answer_key_id], references: [id], onDelete: Cascade)
+
+  @@index([answer_key_id])
+  @@index([answer_key_id, position])
+  @@map("answer_key_groups")
+}
+
+// ============================================
+// GRADE - Ocena pracy ucznia
+// ============================================
+model Grade {
+  id                 String @id @default(uuid())
+  grading_session_id String
+  student_id         String
+
+  // Anonymized Image (zanonimizowany skan/zdjęcie pracy)
+  image_path String  // Ścieżka do pliku z zanonimizowanym obrazem (dane osobowe wymazane przez Sharp)
+
+  // AI Analysis Results
+  ai_response         Json     // Rozliczona odpowiedź AI: {confidence_score, total_score, tasks: [{task_number, points, comment, transcription, certainty, confidence}]}
+  // Wyliczona w kodzie z etykiet 'certainty' poszczególnych zadań, ważona ich maksymalną punktacją.
+  // Model nie podaje żadnej liczby pewności, więc nie może jej sobie wymyślić.
+  confidence_score    Float    // 0-100%, jak bardzo punkty tej pracy trzymają się dowodu
+
+  // Manual Override
+  manually_verified   Boolean  @default(false)
+  final_points        Float?   // Ostateczna liczba punktów (po ewentualnej ręcznej weryfikacji)
+  teacher_notes       String?  // Dodatkowe notatki nauczyciela
+
+  // Poprawki nauczyciela trzymane OSOBNO od ai_response — oryginalna odpowiedź AI zostaje jako ślad
+  teacher_response Json?   // { total_score, tasks: [{task_number, points, comment, edited}] }
+
+  // Który model faktycznie sprawdził pracę (null dla wierszy sprzed tej migracji)
+  model_used  String?
+  escalated   Boolean?
+
+  // Który wariant arkusza trafił do tej pracy i skąd to wiemy: 'ai' = model rozpoznał go z treści kartki,
+  // 'teacher' = nauczyciel wskazał ręcznie, bo AI nie było pewne, 'unresolved' = klasyfikacja już leciała i
+  // model nie rozstrzygnął. Ten trzeci stan jest jedyną oznaką, że pracy nie trzeba klasyfikować ponownie;
+  // bez niego każde wejście na wyniki płaciłoby za klasyfikację od nowa. W sesji z przydziałem wariant
+  // wynika z członkostwa w grupie i tych pól nie trzeba wypełniać.
+  // Null = wariant nierozstrzygnięty, a klasyfikacja WOLNA: pracę albo jeszcze widział tylko /process
+  // przed startem, albo samo wywołanie padło (błąd API, urwana odpowiedź) i następny przebieg spróbuje
+  // ponownie. Taka praca NIE może być oceniona (nie wiadomo, którego klucza użyć) i nie zdejmuje strony
+  // z salda — płaci się dopiero za realnie sprawdzoną pracę.
+  variant_name       String?
+  variant_confidence Int?
+  variant_source     String?
+
+  // Powód, dla którego wariantu jeszcze nie ma — po polsku, do przeczytania przez nauczyciela w karcie
+  // pracy. Sam stan trzyma variant_source, to tylko objaśnienie: bez niego jedynym śladem nieudanego
+  // rozpoznania był log procesu. Kasujemy przy pierwszym rozstrzygnięciu, żeby nie zalegał przy
+  // pracy już sprawdzonej.
+  variant_note String?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  // Relations
+  grading_session GradingSession @relation(fields: [grading_session_id], references: [id], onDelete: Cascade)
+  student         Student         @relation(fields: [student_id], references: [id], onDelete: Cascade)
+
+  @@index([grading_session_id])
+  @@index([student_id])
+  @@map("grades")
+}
