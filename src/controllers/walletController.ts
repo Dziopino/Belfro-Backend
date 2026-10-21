@@ -14,7 +14,7 @@ import { CURRENCY, MONTHLY_PLANS, PAGE_PACKS } from '../config/pricing';
  */
 export async function getWallet(req: Request, res: Response): Promise<void> {
   if (!req.user) {
-    res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
     return;
   }
 
@@ -39,7 +39,7 @@ export async function getWallet(req: Request, res: Response): Promise<void> {
       plans: MONTHLY_PLANS,
     });
   } catch (error) {
-    console.error('Get wallet error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania salda stron:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

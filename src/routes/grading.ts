@@ -34,7 +34,7 @@ router.get('/grading/sessions/:sessionId', getGradingSession);
 // Licznik sprawdzonych prac — karmi pasek postępu, bez przenoszenia ai_response
 router.get('/grading/sessions/:sessionId/progress', getGradingSessionProgress);
 
-// Lista nieobecnych w sesji (jedyna rzecz, którą nauczyciel zmienia po jej utworzeniu)
+// Po utworzeniu sesji nauczyciel zmienia dwie rzeczy: listę nieobecnych i przydział uczniów do grup
 router.patch('/grading/sessions/:sessionId', updateGradingSession);
 
 // Bezpowrotne usunięcie sesji wraz z ocenami i skanami

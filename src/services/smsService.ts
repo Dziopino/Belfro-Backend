@@ -120,7 +120,7 @@ class ConsoleSmsProvider implements SmsProvider {
 
   async send({ to, text }: SmsMessage): Promise<SmsSendResult> {
     console.log(`[SMS:log] do=${maskPolishPhone(to)}`);
-    console.log(`[SMS:log] tresc: ${text}`);
+    console.log(`[SMS:log] treść: ${text}`);
     return { ok: true, providerId: 'console' };
   }
 }

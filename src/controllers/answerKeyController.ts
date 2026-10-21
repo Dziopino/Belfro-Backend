@@ -51,8 +51,8 @@ const SUB_ITEM_ID_MAX_LENGTH = 10;
 
 /**
  * Punkty zaokrąglamy do dwóch miejsc: `0.1 + 0.1 + 0.1` w binarnym zmiennoprzecinkowym daje
- * 0.30000000000000004, a ta liczba idzie do kolumny Float i do tekstu promptu. Podpunkty po 0,5
- * są tu codziennością, więc zaokrąglenie robimy raz, przy normalizacji.
+ * 0.30000000000000004, a ta liczba idzie do kolumny Float i do tekstu promptu.
+ * Podpunkty po 0,5 są tu codziennością, więc zaokrąglenie robimy raz, przy normalizacji.
  */
 function roundPoints(value: number): number {
   return Math.round(value * 100) / 100;
@@ -378,7 +378,7 @@ function keyPayload(key: KeyWithVariants) {
 export async function getAnswerKeys(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -417,8 +417,8 @@ export async function getAnswerKeys(req: Request, res: Response): Promise<void> 
       })),
     });
   } catch (error) {
-    console.error('Get answer keys error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania listy kluczy odpowiedzi:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -429,7 +429,7 @@ export async function getAnswerKeys(req: Request, res: Response): Promise<void> 
 export async function createAnswerKey(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -478,8 +478,8 @@ export async function createAnswerKey(req: Request, res: Response): Promise<void
 
     res.status(201).json({ answer_key: keyPayload(newKey) });
   } catch (error) {
-    console.error('Create answer key error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd tworzenia klucza odpowiedzi:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -490,7 +490,7 @@ export async function createAnswerKey(req: Request, res: Response): Promise<void
 export async function getAnswerKey(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -505,14 +505,14 @@ export async function getAnswerKey(req: Request, res: Response): Promise<void> {
     });
 
     if (!key) {
-      res.status(404).json({ error: 'Answer key not found' });
+      res.status(404).json({ error: 'Answer key not found', code: 'ANSWER_KEY_NOT_FOUND' });
       return;
     }
 
     res.json({ answer_key: keyPayload(key) });
   } catch (error) {
-    console.error('Get answer key error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania klucza odpowiedzi:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -524,7 +524,7 @@ export async function getAnswerKey(req: Request, res: Response): Promise<void> {
 export async function updateAnswerKey(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -540,7 +540,7 @@ export async function updateAnswerKey(req: Request, res: Response): Promise<void
     });
 
     if (!existing) {
-      res.status(404).json({ error: 'Answer key not found' });
+      res.status(404).json({ error: 'Answer key not found', code: 'ANSWER_KEY_NOT_FOUND' });
       return;
     }
 
@@ -613,8 +613,8 @@ export async function updateAnswerKey(req: Request, res: Response): Promise<void
 
     res.json({ answer_key: keyPayload(updated) });
   } catch (error) {
-    console.error('Update answer key error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd zapisu klucza odpowiedzi:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -625,7 +625,7 @@ export async function updateAnswerKey(req: Request, res: Response): Promise<void
 export async function deleteAnswerKey(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -639,7 +639,7 @@ export async function deleteAnswerKey(req: Request, res: Response): Promise<void
     });
 
     if (!existing) {
-      res.status(404).json({ error: 'Answer key not found' });
+      res.status(404).json({ error: 'Answer key not found', code: 'ANSWER_KEY_NOT_FOUND' });
       return;
     }
 
@@ -649,7 +649,7 @@ export async function deleteAnswerKey(req: Request, res: Response): Promise<void
 
     res.json({ message: 'Answer key deleted successfully' });
   } catch (error) {
-    console.error('Delete answer key error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd usuwania klucza odpowiedzi:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

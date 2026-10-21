@@ -15,7 +15,7 @@ type GradeEntry = {
 export async function getThresholds(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -26,8 +26,8 @@ export async function getThresholds(req: Request, res: Response): Promise<void> 
 
     res.json({ thresholds });
   } catch (error) {
-    console.error('Get thresholds error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania progów ocen:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -38,7 +38,7 @@ export async function getThresholds(req: Request, res: Response): Promise<void> 
 export async function createThreshold(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -130,8 +130,8 @@ export async function createThreshold(req: Request, res: Response): Promise<void
 
     res.status(201).json({ threshold: newThreshold });
   } catch (error) {
-    console.error('Create threshold error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd tworzenia skali progów:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -142,7 +142,7 @@ export async function createThreshold(req: Request, res: Response): Promise<void
 export async function updateThreshold(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -158,7 +158,7 @@ export async function updateThreshold(req: Request, res: Response): Promise<void
     });
 
     if (!existing) {
-      res.status(404).json({ error: 'Threshold not found' });
+      res.status(404).json({ error: 'Threshold not found', code: 'THRESHOLD_NOT_FOUND' });
       return;
     }
 
@@ -248,8 +248,8 @@ export async function updateThreshold(req: Request, res: Response): Promise<void
 
     res.json({ threshold: updated });
   } catch (error) {
-    console.error('Update threshold error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd zapisu skali progów:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -260,7 +260,7 @@ export async function updateThreshold(req: Request, res: Response): Promise<void
 export async function deleteThreshold(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -275,7 +275,7 @@ export async function deleteThreshold(req: Request, res: Response): Promise<void
     });
 
     if (!existing) {
-      res.status(404).json({ error: 'Threshold not found' });
+      res.status(404).json({ error: 'Threshold not found', code: 'THRESHOLD_NOT_FOUND' });
       return;
     }
 
@@ -285,7 +285,7 @@ export async function deleteThreshold(req: Request, res: Response): Promise<void
 
     res.json({ message: 'Threshold deleted successfully' });
   } catch (error) {
-    console.error('Delete threshold error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd usuwania skali progów:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

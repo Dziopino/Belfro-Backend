@@ -19,7 +19,7 @@ const GROUP_ASSIGNMENT_MODES = ['manual', 'ai'] as const;
  */
 export async function updateAccount(req: Request, res: Response): Promise<void> {
   if (!req.user) {
-    res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
     return;
   }
 
@@ -125,7 +125,7 @@ export async function updateAccount(req: Request, res: Response): Promise<void> 
 
     res.json({ user: withMaskedPhone(updated) });
   } catch (error) {
-    console.error('Update account error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd aktualizacji konta:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

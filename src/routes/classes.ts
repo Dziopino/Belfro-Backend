@@ -8,6 +8,7 @@ import {
 import {
   getStudents,
   createStudent,
+  appendStudents,
   updateStudent,
   deleteStudent,
 } from '../controllers/studentController';
@@ -31,6 +32,7 @@ router.delete('/classes/:classId', deleteClass);
 // ============================================
 router.get('/classes/:classId/students', getStudents);
 router.post('/classes/:classId/students', createStudent);
+router.post('/classes/:classId/students/append', appendStudents);
 router.put('/students/:studentId', updateStudent);
 router.delete('/students/:studentId', deleteStudent);
 

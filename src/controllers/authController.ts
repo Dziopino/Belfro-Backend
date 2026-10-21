@@ -10,6 +10,7 @@ import { generateToken } from '../utils/jwt';
 import { maskPolishPhone, normalizePolishPhone } from '../utils/phone';
 import { SmsProviderError, buildVerificationSmsText, getSmsProvider } from '../services/smsService';
 import { TurnstileError, getTurnstileConfig, verifyTurnstileToken } from '../services/turnstileService';
+import { ACCOUNT_KINDS, isAccountKind } from '../utils/roster';
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const BCRYPT_ROUNDS = 12;
@@ -38,6 +39,7 @@ export const CLIENT_USER_SELECT = {
   default_grade_threshold_id: true,
   low_balance_alert_threshold: true,
   group_assignment_mode: true,
+  account_kind: true,
   subscription_tier: true,
   subscription_ends_at: true,
   email_verified_at: true,
@@ -119,8 +121,12 @@ export function withMaskedPhone<T extends { phone: string | null }>(
   return { ...user, phone: maskPolishPhone(user.phone) };
 }
 
-/** Kolumny, na których padło ograniczenie unikalności (P2002), albo pusta lista dla innych błędów. */
-function uniqueViolationFields(error: unknown): string[] {
+/**
+ * Kolumny, na których padło ograniczenie unikalności (P2002), albo pusta lista dla innych błędów.
+ * Eksportowane, bo `studentController` rozpoznaje na tym samym duplikat numeru w klasie — drugi
+ * kopiowany `instanceof Prisma.PrismaClientKnownRequestError` to proszenie się o rozjazd.
+ */
+export function uniqueViolationFields(error: unknown): string[] {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') {
     return [];
   }
@@ -160,7 +166,7 @@ export async function captchaConfig(_req: Request, res: Response): Promise<void>
  */
 export async function register(req: Request, res: Response): Promise<void> {
   try {
-    const { email, password, phone, phoneConsent, turnstileToken } = req.body;
+    const { email, password, phone, phoneConsent, turnstileToken, accountKind } = req.body;
 
     // Bramka na boty jako pierwsza czynność: zanim zapytamy bazę, policzymy bcrypt i wyślemy
     // maila. Niedostępny Cloudflare to 503, nie ciche przepuszczenie — bez weryfikacji konto
@@ -177,9 +183,20 @@ export async function register(req: Request, res: Response): Promise<void> {
       return;
     }
 
+    // Typ konta jest deklaracją prawną, nie ozdobą formularza: rozstrzyga, czy w ogóle wolno nam
+    // przechowywać imiona i nazwiska uczniów. Wartość domyślna byłaby tu zgadywaniem, więc brak
+    // tego pola to błąd, a nie fallback.
+    if (!isAccountKind(accountKind)) {
+      res.status(400).json({
+        error: `Account kind must be one of: ${ACCOUNT_KINDS.join(', ')}`,
+        code: 'ACCOUNT_KIND_INVALID',
+      });
+      return;
+    }
+
     // Walidacja
     if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required' });
+      res.status(400).json({ error: 'Email and password are required', code: 'CREDENTIALS_REQUIRED' });
       return;
     }
 
@@ -189,7 +206,7 @@ export async function register(req: Request, res: Response): Promise<void> {
     }
 
     if (password.length < 8) {
-      res.status(400).json({ error: 'Password must be at least 8 characters long' });
+      res.status(400).json({ error: 'Password must be at least 8 characters long', code: 'PASSWORD_TOO_SHORT' });
       return;
     }
 
@@ -221,7 +238,7 @@ export async function register(req: Request, res: Response): Promise<void> {
         try {
           await issueVerificationLink(existingUser);
         } catch (sendError) {
-          console.error('Verification email send error:', sendError);
+          console.error('Błąd wysyłki emaila potwierdzającego:', sendError);
         }
         res.status(409).json({
           error: 'Email not verified. A new confirmation link has been sent.',
@@ -230,7 +247,7 @@ export async function register(req: Request, res: Response): Promise<void> {
         return;
       }
 
-      res.status(409).json({ error: 'User with this email already exists' });
+      res.status(409).json({ error: 'User with this email already exists', code: 'EMAIL_TAKEN' });
       return;
     }
 
@@ -260,6 +277,7 @@ export async function register(req: Request, res: Response): Promise<void> {
           email,
           password: passwordHash,
           encryption_salt: encryptionSalt,
+          account_kind: accountKind,
           pages_current_limit: 350, // Domyślny limit free tier
           pages_total_processed: 0,
           subscription_tier: 'free',
@@ -279,7 +297,7 @@ export async function register(req: Request, res: Response): Promise<void> {
         return;
       }
       if (fields.includes('email')) {
-        res.status(409).json({ error: 'User with this email already exists' });
+        res.status(409).json({ error: 'User with this email already exists', code: 'EMAIL_TAKEN' });
         return;
       }
       throw createError;
@@ -288,7 +306,7 @@ export async function register(req: Request, res: Response): Promise<void> {
     try {
       await issueVerificationLink(user);
     } catch (sendError) {
-      console.error('Verification email send error:', sendError);
+      console.error('Błąd wysyłki emaila potwierdzającego:', sendError);
       res.status(502).json({
         error: 'Account created but the verification email could not be sent',
         code: 'VERIFICATION_EMAIL_FAILED',
@@ -303,8 +321,8 @@ export async function register(req: Request, res: Response): Promise<void> {
       requires_phone_verification: true,
     });
   } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd rejestracji:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -332,7 +350,7 @@ export async function login(req: Request, res: Response): Promise<void> {
 
     // Walidacja
     if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required' });
+      res.status(400).json({ error: 'Email and password are required', code: 'CREDENTIALS_REQUIRED' });
       return;
     }
 
@@ -375,8 +393,8 @@ export async function login(req: Request, res: Response): Promise<void> {
       user: withMaskedPhone(account),
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd logowania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -404,7 +422,7 @@ export async function forgotPassword(req: Request, res: Response): Promise<void>
     }
 
     if (!email) {
-      res.status(400).json({ error: 'Email is required' });
+      res.status(400).json({ error: 'Email is required', code: 'EMAIL_REQUIRED' });
       return;
     }
 
@@ -448,8 +466,8 @@ export async function forgotPassword(req: Request, res: Response): Promise<void>
 
     res.json({ message: 'If an account with that email exists, a password reset link has been sent' });
   } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd prośby o reset hasła:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -464,12 +482,12 @@ export async function resetPassword(req: Request, res: Response): Promise<void> 
     const { token, newPassword } = req.body;
 
     if (!token || !newPassword) {
-      res.status(400).json({ error: 'Token and new password are required' });
+      res.status(400).json({ error: 'Token and new password are required', code: 'RESET_FIELDS_REQUIRED' });
       return;
     }
 
     if (newPassword.length < 8) {
-      res.status(400).json({ error: 'Password must be at least 8 characters long' });
+      res.status(400).json({ error: 'Password must be at least 8 characters long', code: 'PASSWORD_TOO_SHORT' });
       return;
     }
 
@@ -483,7 +501,7 @@ export async function resetPassword(req: Request, res: Response): Promise<void> 
     });
 
     if (!user) {
-      res.status(400).json({ error: 'Invalid or expired reset token' });
+      res.status(400).json({ error: 'Invalid or expired reset token', code: 'RESET_TOKEN_INVALID' });
       return;
     }
 
@@ -507,8 +525,8 @@ export async function resetPassword(req: Request, res: Response): Promise<void> 
       encryption_salt: newEncryptionSalt,
     });
   } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd ustawiania nowego hasła:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -522,7 +540,7 @@ export async function verifyEmail(req: Request, res: Response): Promise<void> {
     const { token } = req.body;
 
     if (!token) {
-      res.status(400).json({ error: 'Token is required' });
+      res.status(400).json({ error: 'Token is required', code: 'TOKEN_REQUIRED' });
       return;
     }
 
@@ -550,8 +568,8 @@ export async function verifyEmail(req: Request, res: Response): Promise<void> {
 
     res.json({ message: 'Email verified' });
   } catch (error) {
-    console.error('Verify email error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd potwierdzania emaila:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -566,7 +584,7 @@ export async function resendVerification(req: Request, res: Response): Promise<v
     const { email } = req.body;
 
     if (!email) {
-      res.status(400).json({ error: 'Email is required' });
+      res.status(400).json({ error: 'Email is required', code: 'EMAIL_REQUIRED' });
       return;
     }
 
@@ -576,14 +594,14 @@ export async function resendVerification(req: Request, res: Response): Promise<v
       try {
         await issueVerificationLink(user);
       } catch (sendError) {
-        console.error('Verification email send error:', sendError);
+        console.error('Błąd wysyłki emaila potwierdzającego:', sendError);
       }
     }
 
     res.json(genericMessage);
   } catch (error) {
-    console.error('Resend verification error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd ponawiania linku potwierdzającego:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -594,7 +612,7 @@ export async function resendVerification(req: Request, res: Response): Promise<v
 export async function getCurrentUser(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -604,14 +622,14 @@ export async function getCurrentUser(req: Request, res: Response): Promise<void>
     });
 
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
       return;
     }
 
     res.json({ user: withMaskedPhone(user) });
   } catch (error) {
-    console.error('Get current user error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania bieżącego konta:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -636,7 +654,7 @@ export async function sendSmsCode(req: Request, res: Response): Promise<void> {
 
   try {
     if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -651,7 +669,7 @@ export async function sendSmsCode(req: Request, res: Response): Promise<void> {
     });
 
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
       return;
     }
 
@@ -701,7 +719,7 @@ export async function sendSmsCode(req: Request, res: Response): Promise<void> {
       }
     } catch (sendError) {
       console.error(
-        'SMS send error:',
+        'Błąd wysyłki kodu SMS:',
         sendError instanceof SmsProviderError ? sendError.message : sendError
       );
 
@@ -725,8 +743,8 @@ export async function sendSmsCode(req: Request, res: Response): Promise<void> {
       phone: maskPolishPhone(user.phone),
     });
   } catch (error) {
-    console.error('Send SMS code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd wysyłki kodu SMS:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -740,7 +758,7 @@ export async function verifySmsCode(req: Request, res: Response): Promise<void> 
 
   try {
     if (!userId) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -765,7 +783,7 @@ export async function verifySmsCode(req: Request, res: Response): Promise<void> 
     });
 
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
       return;
     }
 
@@ -838,7 +856,7 @@ export async function verifySmsCode(req: Request, res: Response): Promise<void> 
 
     res.json({ message: 'Numer telefonu zweryfikowany.', user: updated });
   } catch (error) {
-    console.error('Verify SMS code error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd weryfikacji kodu SMS:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

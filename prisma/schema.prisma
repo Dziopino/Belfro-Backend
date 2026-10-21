@@ -29,6 +29,14 @@ model User {
   // String, nie enum: ta sama droga co subscription_tier, a dodanie trybu nie wymaga migracji typu.
   group_assignment_mode String @default("manual")
 
+  // Czy nauczyciel ma podpisaną ze szkołą umowę powierzenia danych osobowych: "school" albo "private".
+  // To nie ornament — rozstrzyga, czy w ogóle wolno nam trzymać imiona i nazwiska uczniów.
+  // Domyślnie "private": tryb bez umowy jest tym bezpieczniejszym, więc nie wymaga deklaracji, a
+  // przechowywanie nazwisk wymaga jej jawnie. Wierszy założonych przed zmianą to nie rusza —
+  // wszystkie zostały przy "school" i działają dokładnie jak dziś.
+  // String, nie enum, z tego samego powodu co group_assignment_mode wyżej.
+  account_kind String @default("private")
+
   // Subscription & Limits
   pages_current_limit   Int      @default(350)  // Aktualny limit stron w bieżącym okresie
   pages_total_processed Int      @default(0)    // Całkowita liczba przetworzonych stron (licznik życia)
@@ -89,6 +97,12 @@ model Class {
   // Encrypted fields (szyfrowane po stronie klienta)
   encrypted_name String   // Zaszyfrowana nazwa klasy (np. "Klasa 3A")
 
+  // Jak wygląda lista uczniów tej klasy: "named" (imię, nazwisko, numer z dziennika — jak dziś)
+  // albo "numbered" (tylko numer z dziennika, żaden z uczniów nie ma tu nazwiska).
+  // Tryb leży na klasie, nie tylko na koncie: nauczyciel, który podpisze umowę ze szkołą i
+  // przekształci konto, nie może jednym ruchem zadeklarować nazwisk w klasach, gdzie nigdy ich nie było.
+  roster_mode String @default("named")
+
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
@@ -109,9 +123,18 @@ model Student {
   class_id String
 
   // Encrypted fields (WSZYSTKIE dane osobowe szyfrowane)
-  encrypted_first_name String  // Zaszyfrowane imię
-  encrypted_last_name  String  // Zaszyfrowane nazwisko
-  encrypted_number     String  // Zaszyfrowany numer z dziennika
+  // Nullable, bo lista numerowa nie ma czego szyfrować: nauczyciel bez umowy ze szkołą nie przechowuje
+  // imion i nazwisk w ogóle, więc kolumna pusta jest stanem normalnym, a nie brakiem danych.
+  encrypted_first_name String?  // Zaszyfrowane imię
+  encrypted_last_name  String?  // Zaszyfrowane nazwisko
+  encrypted_number     String?  // Zaszyfrowany numer z dziennika
+
+  // Numer z dziennika w liście numerowej — jedyny identyfikator ucznia i jedyna rzecz, którą
+  // nauczyciel widzi na ekranie. Jawnie, nie szyfrowany: bez nazwiska i bez dostępu do dziennika
+  // szkolnego sam w sobie niczego o dziecku nie mówi, a klucz z losowym IV i tak nie dałby
+  // unikalności w bazie (ten sam numer w dwóch wierszach dałby dwa różne bloby).
+  // W liście z nazwiskami pozostaje NULL — tam numer nadal leży w encrypted_number.
+  journal_number Int?
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
@@ -121,6 +144,9 @@ model Student {
   grades Grade[]
 
   @@index([class_id])
+  // W Postgres NULL-e nie kolizjonują, więc indeks dotyczy wyłącznie list numerowych i nie przeszkadza
+  // wierszom z nazwiskami, gdzie journal_number jest NULL-em.
+  @@unique([class_id, journal_number])
   @@map("students")
 }
 

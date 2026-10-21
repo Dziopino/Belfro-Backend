@@ -72,7 +72,7 @@ export async function verifyTurnstileToken(token: unknown): Promise<void> {
       );
     }
 
-    console.warn('[Turnstile] Missing TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY — skipping verification');
+    console.warn('[Turnstile] Brak TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY — pomijam weryfikację');
     return;
   }
 
@@ -116,7 +116,7 @@ export async function verifyTurnstileToken(token: unknown): Promise<void> {
   if (result.success !== true) {
     // `error-codes` to kody Cloudflare, nie treść od klienta — bezpieczne do loga,
     // ale i tak tylko w logu: nauczyciel dostaje jeden polski komunikat z frontu.
-    console.error('[Turnstile] Rejected token:', describeErrorCodes(result['error-codes']));
+    console.error('[Turnstile] Odrzucony token:', describeErrorCodes(result['error-codes']));
     throw new TurnstileError('CAPTCHA_FAILED', 'Turnstile rejected the token');
   }
 }

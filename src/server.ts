@@ -2,6 +2,7 @@ import express, { Application, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { UPLOADS_ROOT } from './config/paths';
+import { errorHandler } from './middleware/errorHandler';
 import authRoutes from './routes/auth';
 import classRoutes from './routes/classes';
 import gradingRoutes from './routes/grading';
@@ -43,13 +44,17 @@ app.use('/api', accountRoutes); // Ustawienia konta: profil i preferencje
 
 // 404 handler
 app.use((_req: Request, res: Response) => {
-  res.status(404).json({ error: 'Route not found' });
+  res.status(404).json({ error: 'Route not found', code: 'ROUTE_NOT_FOUND' });
 });
+
+// Terminalny przechwytywacz błędów — ostatni w łańcuchu, bo Express rozpoznaje go po czterech
+// argumentach i odpala tylko wtedy, gdy coś w łańcuchu zawoła `next(error)`.
+app.use(errorHandler);
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🚀 Serwer działa na porcie ${PORT}`);
+  console.log(`📝 Środowisko: ${process.env.NODE_ENV || 'development'}`);
 });
 
 export default app;

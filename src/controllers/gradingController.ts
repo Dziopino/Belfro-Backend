@@ -5,6 +5,7 @@ import path from 'path';
 import fs from 'fs';
 import prisma from '../config/database';
 import { ANONYMIZED_DIR, absoluteUploadPath } from '../config/paths';
+import { enhanceAnonymizedScan } from '../utils/scanEnhancement';
 import {
   detectVariantFromImage,
   gradeWithHybridAI,
@@ -260,14 +261,17 @@ function freezeVariants(variants: KeyVariant[]) {
 /**
  * Grupa = wariant arkusza dla części klasy: własny klucz odpowiedzi i własna lista uczniów.
  * Warianty definiuje się w kluczu odpowiedzi, więc żądanie niesie TYLKO przydział uczniów
- * {name, student_ids}; klucz grupy serwery składają z wariantu biblioteki. Dzięki temu klient
+ * {name, student_ids}; klucz grupy składa serwer z wariantu biblioteki. Dzięki temu klient
  * nie może podsunąć pod nazwę grupy cudzego klucza ani innego mianownika punktów.
- * Trzy zasady, bez których sesji grupowej nie da się później odratować:
+ * Zasady, bez których sesji grupowej nie da się później odratować:
  * - listy uczniów nie mogą się przenikać — ten sam uczeń z dwoma wersjami pracy to dwa wyniki;
  * - każdy identyfikator musi być uczniem tej klasy — cudzy UUID zawyżyłby mianownik „brak pracy";
- * - każda grupa musi mieć co najmniej jednego ucznia i musi odpowiadać wariantowi z klucza.
- * Kolejność z żądania staje się `position`, więc nauczyciel widzi grupy w tej samej kolejności
- * w kreatorze, w kolejce i w PDF.
+ * - każda nazwa z żądania musi odpowiadać wariantowi z klucza.
+ * Wiersz powstaje dla KAŻDEGO wariantu klucza, także dla tego, do którego nie przydzielono nikogo.
+ * Grupa pusta nie jest dekoracją: gdy w innym terminie napisze ją uczeń zdjęty z nieobecności,
+ * przydział szuka jej w wierszach sesji — bez wiersza nie ma czym sprawdzić tego arkusza. `position`
+ * bierze kolejność wariantów z klucza, więc nauczyciel widzi grupy tak samo w kreatorze, w kolejce,
+ * w historii i w PDF, niezależnie od tego, kogo i w jakiej kolejności przypiął.
  */
 async function parseSessionGroups(
   value: unknown,
@@ -310,7 +314,7 @@ async function parseSessionGroups(
 
   const variantsByName = new Map(key.variants.map((variant) => [variant.name.toLocaleLowerCase(), variant]));
   const assignedTo = new Map<string, string>();
-  const groups: SessionGroupWrite[] = [];
+  const studentIdsByVariant = new Map<string, string[]>();
 
   for (let index = 0; index < value.length; index++) {
     const raw = value[index] as Record<string, unknown> | null;
@@ -339,7 +343,9 @@ async function parseSessionGroups(
       };
     }
 
-    if (groups.some((group) => group.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+    const variantKey = variant.name.toLocaleLowerCase();
+
+    if (studentIdsByVariant.has(variantKey)) {
       return { ok: false, code: 'GROUP_NAME_DUPLICATED', error: `group ${name} is listed twice` };
     }
 
@@ -353,10 +359,6 @@ async function parseSessionGroups(
 
     const studentIds = idsFromJsonArray(raw.student_ids);
 
-    if (studentIds.length === 0) {
-      return { ok: false, code: 'GROUP_STUDENTS_EMPTY', error: `group ${name} has no students` };
-    }
-
     for (const id of studentIds) {
       if (assignedTo.has(id)) {
         return {
@@ -369,17 +371,7 @@ async function parseSessionGroups(
       assignedTo.set(id, name);
     }
 
-    groups.push({
-      name: variant.name,
-      position: index,
-      answer_key: {
-        tasks: toTaskArray(variant.tasks),
-        total_points: variant.total_points,
-      } as Prisma.InputJsonValue,
-      answer_key_id: key.id,
-      keyName: key.name,
-      student_ids: studentIds,
-    });
+    studentIdsByVariant.set(variantKey, studentIds);
   }
 
   // Jedno zapytanie na sumę uczniów wszystkich grup: listy są rozłączne, więc liczba z bazy
@@ -395,7 +387,199 @@ async function parseSessionGroups(
     };
   }
 
+  // Wiersz powstaje dla każdego wariantu klucza, także dla tego, do którego nikt nie trafił. Pusta
+  // lista nie jest tu błędem do wycięcia: bez wiersza wariant znika z sesji na zawsze, a ekran
+  // przydziału szuka grup wyłącznie wśród jej wierszy — ucznia piszącego ten arkusz w innym terminie
+  // nie byłoby czym sprawdzić.
+  const groups: SessionGroupWrite[] = key.variants.map((variant, index) => ({
+    name: variant.name,
+    position: index,
+    answer_key: {
+      tasks: toTaskArray(variant.tasks),
+      total_points: variant.total_points,
+    } as Prisma.InputJsonValue,
+    answer_key_id: key.id,
+    keyName: key.name,
+    student_ids: studentIdsByVariant.get(variant.name.toLocaleLowerCase()) ?? [],
+  }));
+
   return { ok: true, groups };
+}
+
+/** Wiersz grupy wczytany z sesji: nazwa, identyfikator i dotychczasowy przydział. */
+type SessionGroupRow = { id: string; name: string; student_ids: unknown };
+
+type SessionGroupsPatchResult =
+  | { ok: true; updates: { id: string; student_ids: string[] }[] }
+  | { ok: false; code: string; error: string };
+
+/**
+ * Przydział uczniów w sesji, która już leży w bazie. Warianty definiują tu wiersze
+ * `grading_session_groups`, więc nie zaglądamy do biblioteki: klucz odpowiedzi mógł się zmienić po
+ * utworzeniu sesji, a przy każdej nazwie wisi zamrożony snapshot punktów.
+ * Żądanie zmienia wyłącznie `student_ids` istniejących wierszy. Zasady:
+ * - zbiór nazw w żądaniu to dokładnie zbiór nazw sesji — nowa nazwa nie ma własnego klucza, z
+ *   którego można by sprawdzać, a pominięta grupa zostaje w bazie bez przydziału;
+ * - listy uczniów pozostają rozłączne, a każdy identyfikator musi być uczniem tej klasy;
+ * - pracy z policzonymi punktami (`final_points`) nie przenosimy: jej wynik liczono z klucza dawnej
+ *   grupy, a w sesji z przydziałem nie ma ścieżki przeliczenia, która nie kosztowałaby nauczyciela
+ *   strony po cichu;
+ * - ucznia z dodaną pracą nie wolno wyrzucić ze wszystkich grup — bez przydziału jego praca i tak
+ *   idzie do sprawdzenia z kluczem pierwszej grupy.
+ * Grupa bez uczniów jest dozwolona w obu trybach: wiersza i tak nie kasujemy, a pusta lista znaczy
+ * tyle, że nikt nie pisze tego wariantu w tym terminie.
+ */
+async function parseSessionGroupsPatch(
+  value: unknown,
+  rows: readonly SessionGroupRow[],
+  classId: string,
+  gradedIds: ReadonlySet<string>,
+  workedIds: ReadonlySet<string>
+): Promise<SessionGroupsPatchResult> {
+  if (!Array.isArray(value)) {
+    return { ok: false, code: 'GROUPS_INVALID', error: 'groups must be an array' };
+  }
+
+  if (value.length === 0) {
+    return { ok: false, code: 'GROUPS_INVALID', error: 'groups must contain at least one group' };
+  }
+
+  if (value.length > SESSION_GROUPS_MAX_COUNT) {
+    return {
+      ok: false,
+      code: 'GROUPS_LIMIT_EXCEEDED',
+      error: `groups must contain at most ${SESSION_GROUPS_MAX_COUNT} entries`,
+    };
+  }
+
+  const rowByLowerName = new Map(rows.map((row) => [row.name.toLocaleLowerCase(), row]));
+  const currentRowOf = new Map<string, string>();
+
+  for (const row of rows) {
+    for (const id of idsFromJsonArray(row.student_ids)) currentRowOf.set(id, row.id);
+  }
+
+  const assignedTo = new Map<string, string>();
+  const updates: { id: string; student_ids: string[] }[] = [];
+
+  for (let index = 0; index < value.length; index++) {
+    const raw = value[index] as Record<string, unknown> | null;
+
+    if (!raw || typeof raw !== 'object') {
+      return { ok: false, code: 'GROUPS_INVALID', error: `groups[${index}] must be an object` };
+    }
+
+    const name = typeof raw.name === 'string' ? raw.name.trim() : '';
+
+    if (!name || name.length > GROUP_NAME_MAX_LENGTH) {
+      return {
+        ok: false,
+        code: 'GROUP_NAME_INVALID',
+        error: `group name must be a non-empty string of at most ${GROUP_NAME_MAX_LENGTH} characters`,
+      };
+    }
+
+    const row = rowByLowerName.get(name.toLocaleLowerCase());
+
+    if (!row) {
+      return {
+        ok: false,
+        code: 'SESSION_GROUPS_MISMATCH',
+        error: `group ${name} is not a group of this session`,
+      };
+    }
+
+    if (updates.some((update) => update.id === row.id)) {
+      return { ok: false, code: 'GROUP_NAME_DUPLICATED', error: `group ${name} is listed twice` };
+    }
+
+    if (Array.isArray(raw.student_ids) && raw.student_ids.length > GROUP_STUDENTS_MAX_COUNT) {
+      return {
+        ok: false,
+        code: 'GROUP_STUDENTS_TOO_MANY',
+        error: `groups[${index}].student_ids must contain at most ${GROUP_STUDENTS_MAX_COUNT} entries`,
+      };
+    }
+
+    const studentIds = idsFromJsonArray(raw.student_ids);
+
+    for (const id of studentIds) {
+      if (assignedTo.has(id)) {
+        return {
+          ok: false,
+          code: 'GROUP_STUDENT_DUPLICATED',
+          error: 'A student can be assigned to only one group',
+        };
+      }
+
+      assignedTo.set(id, row.id);
+    }
+
+    updates.push({ id: row.id, student_ids: studentIds });
+  }
+
+  const missingNames = rows
+    .filter((row) => !updates.some((update) => update.id === row.id))
+    .map((row) => row.name);
+
+  if (missingNames.length > 0) {
+    return {
+      ok: false,
+      code: 'SESSION_GROUPS_MISMATCH',
+      error: `groups must list every group of this session: ${missingNames.join(', ')}`,
+    };
+  }
+
+  // Jedno zapytanie o sumę uczniów wszystkich grup: listy są rozłączne, więc liczba z bazy musi
+  // się zgadzać co do identyfikatora.
+  const allIds = Array.from(assignedTo.keys());
+  const found = await prisma.student.count({ where: { id: { in: allIds }, class_id: classId } });
+
+  if (found !== allIds.length) {
+    return {
+      ok: false,
+      code: 'GROUP_STUDENT_NOT_IN_CLASS',
+      error: 'Group student does not belong to this class',
+    };
+  }
+
+  const nameOf = new Map(rows.map((row) => [row.id, row.name]));
+
+  for (const [id, rowId] of currentRowOf) {
+    const after = assignedTo.get(id) ?? null;
+
+    if (after === rowId) continue;
+
+    if (gradedIds.has(id)) {
+      return {
+        ok: false,
+        code: 'GROUP_STUDENT_HAS_WORK',
+        error: `group ${nameOf.get(rowId)}: a student whose points were already computed cannot change group`,
+      };
+    }
+
+    if (after === null && workedIds.has(id)) {
+      return {
+        ok: false,
+        code: 'GROUP_STUDENT_HAS_SCAN',
+        error: `group ${nameOf.get(rowId)}: a student with an uploaded work has to stay in a group`,
+      };
+    }
+  }
+
+  for (const [id, rowId] of assignedTo) {
+    // Uczeń dotąd poza przydziałem, czyli sprawdzany z kluczem sesji — przeniesienie go do grupy
+    // przepisałoby, z jakiego klucza liczony jest jego wynik, więc zostaje zablokowane.
+    if (gradedIds.has(id) && !currentRowOf.has(id)) {
+      return {
+        ok: false,
+        code: 'GROUP_STUDENT_HAS_WORK',
+        error: `group ${nameOf.get(rowId)}: a student whose points were already computed cannot change group`,
+      };
+    }
+  }
+
+  return { ok: true, updates };
 }
 
 /**
@@ -491,7 +675,7 @@ function countMissingStudents(
 export async function createGradingSession(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -499,7 +683,7 @@ export async function createGradingSession(req: Request, res: Response): Promise
 
     // Walidacja
     if (!class_id) {
-      res.status(400).json({ error: 'Class ID is required' });
+      res.status(400).json({ error: 'Class ID is required', code: 'CLASS_ID_REQUIRED' });
       return;
     }
 
@@ -512,7 +696,7 @@ export async function createGradingSession(req: Request, res: Response): Promise
     });
 
     if (!classData) {
-      res.status(404).json({ error: 'Class not found' });
+      res.status(404).json({ error: 'Class not found', code: 'CLASS_NOT_FOUND' });
       return;
     }
 
@@ -677,21 +861,23 @@ export async function createGradingSession(req: Request, res: Response): Promise
 
     res.status(201).json({ session });
   } catch (error) {
-    console.error('Create grading session error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd tworzenia sesji sprawdzania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
 /**
  * PATCH /api/grading/sessions/:sessionId
- * Aktualnie jedyne pole, które nauczyciel może zmienić po utworzeniu sesji: lista nieobecnych.
- * Klucz odpowiedzi i próg ocen zostają zamrożonym snapshotem — ich edycja przepisałaby
- * już sprawdzone prace, a tego historia sesji nie może robić.
+ * Dwa pola, które nauczyciel może zmienić po utworzeniu sesji: lista nieobecnych i przydział
+ * uczniów do grup. Klucz odpowiedzi i próg ocen zostają zamrożonym snapshotem — ich edycja
+ * przepisałaby już sprawdzone prace, a tego historia sesji nie może robić.
+ * Przydział grup jest możliwy dopóki praca nie ma policzonych punktów; przeniesienie ocenionego
+ * ucznia zmieniłoby klucz, z którego liczono jego wynik (parseSessionGroupsPatch).
  */
 export async function updateGradingSession(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -701,6 +887,9 @@ export async function updateGradingSession(req: Request, res: Response): Promise
       where: {
         id: sessionId,
         user_id: req.user.userId,
+      },
+      include: {
+        session_groups: { orderBy: { position: 'asc' } },
       },
     });
 
@@ -714,22 +903,25 @@ export async function updateGradingSession(req: Request, res: Response): Promise
       return;
     }
 
-    if (req.body?.absent_student_ids === undefined) {
+    const wantsAbsent = req.body?.absent_student_ids !== undefined;
+    const wantsGroups = req.body?.groups !== undefined && req.body?.groups !== null;
+
+    if (!wantsAbsent && !wantsGroups) {
       res.status(400).json({
-        error: 'absent_student_ids is required',
-        code: 'ABSENT_STUDENTS_INVALID',
+        error: 'absent_student_ids or groups is required',
+        code: 'SESSION_PATCH_EMPTY',
       });
       return;
     }
 
-    const absentResult = parseAbsentIdsPayload(req.body.absent_student_ids);
+    const absentResult = wantsAbsent ? parseAbsentIdsPayload(req.body.absent_student_ids) : null;
 
-    if (!absentResult.ok) {
+    if (absentResult && !absentResult.ok) {
       res.status(400).json({ error: absentResult.error, code: absentResult.code });
       return;
     }
 
-    if (!(await absentIdsBelongToClass(absentResult.ids, session.class_id))) {
+    if (absentResult && !(await absentIdsBelongToClass(absentResult.ids, session.class_id))) {
       res.status(400).json({
         error: 'Absent student does not belong to this class',
         code: 'ABSENT_STUDENT_NOT_IN_CLASS',
@@ -737,15 +929,91 @@ export async function updateGradingSession(req: Request, res: Response): Promise
       return;
     }
 
+    let groupUpdates: { id: string; student_ids: string[] }[] = [];
+    let workedIds = new Set<string>();
+
+    if (wantsGroups) {
+      if (session.group_assignment_mode === 'ai') {
+        res.status(400).json({
+          error: 'This session recognizes variants from the scan; group assignment is not used',
+          code: 'GROUPS_NOT_ALLOWED_WITH_VARIANT_DETECTION',
+        });
+        return;
+      }
+
+      if (session.session_groups.length === 0) {
+        res.status(400).json({ error: 'This session has no groups', code: 'SESSION_HAS_NO_GROUPS' });
+        return;
+      }
+
+      // Jeden odczyt prac: `final_points` mówi, których wyników już nie ruszamy, a sama obecność
+      // wiersza — kogo nie wolno wyrzucić poza wszystkie grupy.
+      const works = await prisma.grade.findMany({
+        where: { grading_session_id: session.id },
+        select: { student_id: true, final_points: true },
+      });
+
+      workedIds = new Set(works.map((work) => work.student_id));
+
+      const patch = await parseSessionGroupsPatch(
+        req.body.groups,
+        session.session_groups,
+        session.class_id,
+        new Set(works.filter((work) => work.final_points !== null).map((work) => work.student_id)),
+        workedIds
+      );
+
+      if (!patch.ok) {
+        res.status(400).json({ error: patch.error, code: patch.code });
+        return;
+      }
+
+      groupUpdates = patch.updates;
+    }
+
+    // Sesja „zakończona" przestaje być zakończona, gdy przydział urośnie o kogoś bez pracy —
+    // inaczej historia dalej obiecywałaby komplet wyników. Liczymy to samo co `/process`.
+    let nextStatus: string | null = null;
+
+    if (wantsGroups && session.status === 'completed') {
+      const rows = session.session_groups.map((row) => ({
+        student_ids: groupUpdates.find((group) => group.id === row.id)?.student_ids ?? row.student_ids,
+      }));
+
+      const missing = countMissingStudents(
+        groupPopulationIds(rows),
+        new Set<string>(absentResult ? absentResult.ids : idsFromJsonArray(session.absent_student_ids)),
+        workedIds
+      );
+
+      if (missing > 0) nextStatus = 'awaiting_works';
+    }
+
     const updated = await prisma.gradingSession.update({
       where: { id: session.id },
-      data: { absent_student_ids: absentResult.ids },
+      data: {
+        ...(absentResult && { absent_student_ids: absentResult.ids }),
+        ...(groupUpdates.length > 0 && {
+          // Zagnieżdżone `update` to jedna transakcja: przydział nigdy nie zostaje w połowie
+          // przeniesiony, co byłoby dwiema grupami z tym samym uczniem.
+          session_groups: {
+            update: groupUpdates.map((group) => ({
+              where: { id: group.id },
+              data: { student_ids: group.student_ids },
+            })),
+          },
+        }),
+        ...(nextStatus && { status: nextStatus }),
+      },
+      include: {
+        session_groups: { orderBy: { position: 'asc' } },
+      },
     });
 
     res.json({ session: updated });
   } catch (error) {
-    console.error('Update grading session error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd aktualizacji sesji sprawdzania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -762,8 +1030,55 @@ async function deleteSessionScans(imagePaths: string[]): Promise<void> {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'ENOENT') {
         // Bez ścieżki w logu: nazwa pliku niesie uuid ucznia
-        console.warn('Scan file left on disk after session delete:', code ?? 'unknown error');
+        console.warn('Skan został na dysku po usunięciu sesji:', code ?? 'nieznany błąd');
       }
+    }
+  }
+}
+
+/**
+ * Nadpisana praca zostawiała poprzedni skan na dysku na zawsze: każde ponowne wgranie tworzy plik
+ * z nowym `Date.now()`, a gałąź aktualizacji `Grade` przepisywała `image_path` bez kasacji
+ * poprzednika, więc `deleteSessionScans` (patrz wyżej) nigdy o nim nie słyszał.
+ *
+ * Kasujemy wyłącznie plik, co do którego mamy trzy dowody, i dlatego są to trzy osobne warunki:
+ *  1. ścieżka przyszła z tego właśnie wiersza `Grade`, który aktualizujemy — nie z żądania,
+ *  2. `absoluteUploadPath` ją przyjmie, a jej katalogiem jest dokładnie `ANONYMIZED_DIR`,
+ *     więc nie ma mowy o `..` ani o pliku pozaanonimizowanym,
+ *  3. żaden inny wiersz `Grade` już jej nie wskazuje — sprawdzane PO aktualizacji, bo wtedy
+ *     nadpisany wiersz ma w bazie nowy path i ewentualne trafienie to realna druga praca.
+ *
+ * Każdy wątek niepewności zostawia plik. W drzewie bez kontroli wersji nie ma sposobu odkręcić
+ * skasowanego materiału ucznia, a nadmiarowy plik jest tylko droższy o kilka kilobajtów.
+ */
+async function deleteReplacedScan(storedPath: string): Promise<void> {
+  let absolute: string;
+
+  try {
+    absolute = path.resolve(absoluteUploadPath(storedPath));
+  } catch {
+    console.warn('Zastąpiony skan został na dysku: ścieżka poza katalogiem uploads');
+    return;
+  }
+
+  if (path.dirname(absolute) !== path.resolve(ANONYMIZED_DIR)) {
+    console.warn('Zastąpiony skan został na dysku: ścieżka poza katalogiem anonimizacji');
+    return;
+  }
+
+  try {
+    const stillReferenced = await prisma.grade.findFirst({
+      where: { image_path: storedPath },
+      select: { id: true },
+    });
+
+    if (stillReferenced) return;
+
+    await fs.promises.unlink(absolute);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      console.warn('Zastąpiony skan został na dysku:', code ?? 'nieznany błąd');
     }
   }
 }
@@ -775,7 +1090,7 @@ async function deleteSessionScans(imagePaths: string[]): Promise<void> {
 export async function deleteGradingSession(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -813,8 +1128,8 @@ export async function deleteGradingSession(req: Request, res: Response): Promise
 
     res.json({ message: 'Session deleted successfully' });
   } catch (error) {
-    console.error('Delete grading session error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd usuwania sesji sprawdzania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -832,13 +1147,13 @@ export async function deleteGradingSession(req: Request, res: Response): Promise
 export async function uploadAndAnonymizeImage(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
     // Sprawdź czy plik został przesłany
     if (!req.file) {
-      res.status(400).json({ error: 'No file uploaded' });
+      res.status(400).json({ error: 'No file uploaded', code: 'FILE_MISSING' });
       return;
     }
 
@@ -846,7 +1161,7 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
 
     // Walidacja
     if (!student_id || !session_id || x === undefined || y === undefined || !width || !height) {
-      res.status(400).json({ error: 'Missing required fields: student_id, session_id, x, y, width, height' });
+      res.status(400).json({ error: 'Missing required fields: student_id, session_id, x, y, width, height', code: 'RECT_FIELDS_MISSING' });
       return;
     }
 
@@ -857,7 +1172,7 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
     const rectHeight = parseInt(height, 10);
 
     if (isNaN(rectX) || isNaN(rectY) || isNaN(rectWidth) || isNaN(rectHeight)) {
-      res.status(400).json({ error: 'Invalid coordinates' });
+      res.status(400).json({ error: 'Invalid coordinates', code: 'RECT_INVALID' });
       return;
     }
 
@@ -870,7 +1185,7 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
     });
 
     if (!session) {
-      res.status(404).json({ error: 'Grading session not found' });
+      res.status(404).json({ error: 'Grading session not found', code: 'SESSION_NOT_FOUND' });
       return;
     }
 
@@ -886,12 +1201,12 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
     });
 
     if (!student) {
-      res.status(404).json({ error: 'Student not found' });
+      res.status(404).json({ error: 'Student not found', code: 'STUDENT_NOT_FOUND' });
       return;
     }
 
-    console.log('🔍 Processing image anonymization...');
-    console.log(`📐 Rectangle: x=${rectX}, y=${rectY}, width=${rectWidth}, height=${rectHeight}`);
+    console.log('🔍 Anonimizuję zdjęcie...');
+    console.log(`📐 Prostokąt: x=${rectX}, y=${rectY}, width=${rectWidth}, height=${rectHeight}`);
 
     // Współrzędne z przeglądarki opisują kadr PO obrocie z EXIF, więc ramkę liczymy tak samo
     const source = await sharp(req.file.buffer).metadata().catch(() => null);
@@ -921,7 +1236,7 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
       return;
     }
 
-    console.log(`🖼 Frame after EXIF rotation: ${frameWidth}x${frameHeight}, redacted: x=${redactionX}, y=${redactionY}, ${redactionWidth}x${redactionHeight}`);
+    console.log(`🖼 Ramka po rotacji EXIF: ${frameWidth}x${frameHeight}, zamalowane: x=${redactionX}, y=${redactionY}, ${redactionWidth}x${redactionHeight}`);
 
     // KLUCZOWY MOMENT: Anonimizacja obrazu przez Sharp
     // 1. Stwórz białą nakładkę (prostokąt zamazujący dane osobowe)
@@ -939,7 +1254,9 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
     // 2. Nałóż białą nakładkę na oryginalny buffer (TRWAŁE ZAMALOWANIE)
     // .rotate() normalizuje orientację z EXIF — bez niej piksele zostają w orientacji czujnika,
     // a współrzędne z podglądu (przeglądarka obraca) trafiają w inne miejsce albo poza kadr.
-    const anonymizedBuffer = await sharp(req.file.buffer)
+    // Schodzimy do PNG, nie do JPEG: wzmocnienie ma widzieć piksele PO masce, a bezstratny
+    // pośrednik oznacza, że stratna kompresja nadal dzieje dokładnie jeden raz (poniżej, q90).
+    const maskedBuffer = await sharp(req.file.buffer)
       .rotate()
       .composite([
         {
@@ -948,8 +1265,19 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
           top: redactionY,
         },
       ])
-      .jpeg({ quality: 90 })
+      .png()
       .toBuffer();
+
+    // 2b. Wzmocnienie widoczności pisma — wyłącznie na buforze po zamazaniu. Funkcja nie zmienia
+    // wymiarów, a najgorszy jej wynik to dzisiejszy zapis bez filtra. Prostopadł maski jedziemy
+    // dalej po to, żeby wzmocnienie domalowało go czystą bielą PO `sharpen`: inaczej pierścień
+    // wyostrzenia nadtłuży brzeg prostokąta i ślad po zamazaniu będzie widoczny.
+    const anonymizedBuffer = await enhanceAnonymizedScan(
+      maskedBuffer,
+      { width: frameWidth, height: frameHeight },
+      undefined,
+      { x: redactionX, y: redactionY, width: redactionWidth, height: redactionHeight }
+    );
 
     // 3. Zapisz zanonimizowany plik na dysku — zapis i `express.static` muszą używać tego samego korzenia
     const uploadsDir = ANONYMIZED_DIR;
@@ -960,9 +1288,9 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
     const filename = `anonymized_${session_id}_${student_id}_${Date.now()}.jpg`;
     const filepath = path.join(uploadsDir, filename);
 
-    await sharp(anonymizedBuffer).toFile(filepath);
-
-    console.log('✅ Image anonymized and saved:', filename);
+    // Zapis surowych bajtów, bez drugiego obiegu `sharp(...).toFile()`: tamten przepisywał JPEG
+    // już zakodowany powyżej i dokładał drugą stratną kompresję na domyślnej jakości.
+    await fs.promises.writeFile(filepath, anonymizedBuffer);
 
     // 4. WYCZYŚĆ ORYGINALNY BUFFER Z PAMIĘCI (bezpieczeństwo)
     // TypeScript/Node.js automatycznie zwolni pamięć, ale możemy wymusić
@@ -982,6 +1310,10 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
 
     if (grade) {
       // Aktualizuj istniejący grade (użytkownik przesłał nowe zdjęcie)
+      // Ścieżkę czytamy PRZED zapisem: po `update` wiersz niesie już nowy plik i nie mielibyśmy
+      // czym sprawdzić, czy poprzednik nadal do czegoś wskazuje.
+      const replacedPath = grade.image_path;
+
       grade = await prisma.grade.update({
         where: { id: grade.id },
         data: {
@@ -991,6 +1323,8 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
           confidence_score: 0,
         },
       });
+
+      await deleteReplacedScan(replacedPath);
     } else {
       // Utwórz nowy grade
       grade = await prisma.grade.create({
@@ -1010,8 +1344,8 @@ export async function uploadAndAnonymizeImage(req: Request, res: Response): Prom
       image_path: relativePath,
     });
   } catch (error) {
-    console.error('Upload and anonymize error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd przyjęcia i anonimizacji skanu:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -1028,7 +1362,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
 
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -1053,7 +1387,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
     });
 
     if (!session) {
-      res.status(404).json({ error: 'Grading session not found' });
+      res.status(404).json({ error: 'Grading session not found', code: 'SESSION_NOT_FOUND' });
       return;
     }
 
@@ -1078,7 +1412,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
     });
 
     if (!user) {
-      res.status(404).json({ error: 'User not found' });
+      res.status(404).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
       return;
     }
 
@@ -1093,6 +1427,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
     if (user.pages_current_limit < pendingCount) {
       res.status(403).json({
         error: 'Page limit exceeded',
+        code: 'PAGE_LIMIT_EXCEEDED',
         current_limit: user.pages_current_limit,
         required_pages: pendingCount,
         message: `You need ${pendingCount} pages but only have ${user.pages_current_limit} remaining.`,
@@ -1125,7 +1460,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
 
     claimHeld = true;
 
-    console.log(`🤖 Starting AI processing for ${pendingCount} students...`);
+    console.log(`🤖 Startuję sprawdzanie AI dla ${pendingCount} uczniów...`);
 
     // Klucz pracy = klucz grupy, do której należy jej uczeń; sesja bez grup ma jeden wspólny klucz.
     const keyForStudent = buildAnswerKeyResolver(session);
@@ -1175,8 +1510,8 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
       });
       console.warn(
         needsTeacher
-          ? `⏸️ Variant unresolved for grade ${grade.id}, grading skipped`
-          : `🔁 Variant classification failed for grade ${grade.id}, will retry on next process`
+          ? `⏸️ Wariant pracy ${grade.id} nierozstrzygnięty, sprawdzanie pominięte`
+          : `🔁 Klasyfikacja wariantu pracy ${grade.id} nieudana, wznowię przy następnym sprawdzaniu`
       );
     };
 
@@ -1189,7 +1524,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
         });
 
         if (!currentUser || currentUser.pages_current_limit <= 0) {
-          console.error('⚠️ Page limit exceeded during processing');
+          console.error('⚠️ Brak stron na koncie w trakcie sprawdzania');
           break;
         }
 
@@ -1254,7 +1589,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
           }
         }
 
-        console.log(`📄 Processing grade ${processedCount + 1}/${gradesCount}...`);
+        console.log(`📄 Sprawdzam pracę ${processedCount + 1}/${gradesCount}...`);
 
         // HYBRYDOWE WYWOŁANIE AI z automatyczną eskalacją
         const { result: aiResponse, model_used, escalated } = await gradeWithHybridAI(
@@ -1262,8 +1597,8 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
           answerKey
         );
 
-        console.log(`🤖 Model used: ${model_used} ${escalated ? '(escalated)' : ''}`);
-        console.log(`📊 Confidence: ${aiResponse.confidence_score}%, Score: ${aiResponse.total_score}`);
+        console.log(`🤖 Użyty model: ${model_used} ${escalated ? '(eskalowany)' : ''}`);
+        console.log(`📊 Pewność: ${aiResponse.confidence_score}%, Punkty: ${aiResponse.total_score}`);
 
         // Zapis wyniku: `total_score` nie jest już arytmetyczną deklaracją modelu — serwis policzył go
         // z wierszy, które model sam wystawił, więc final_points nie może rozmijać się z tabelą punktów.
@@ -1298,9 +1633,9 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
           ...(variant && { variant_name: variant.name }),
         });
 
-        console.log(`✅ Processed ${processedCount}/${gradesCount}`);
+        console.log(`✅ Sprawdzonych ${processedCount}/${gradesCount}`);
       } catch (error) {
-        console.error(`❌ Failed to process grade ${grade.id}:`, error);
+        console.error(`❌ Nie udało się sprawdzić pracy ${grade.id}:`, error);
         results.push({
           grade_id: grade.id,
           student_id: grade.student_id,
@@ -1350,18 +1685,18 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
       results,
     });
   } catch (error) {
-    console.error('Process session error:', error);
+    console.error('Błąd sprawdzania sesji:', error);
 
     // Zwolnij przejęcie, żeby sesja nie czekała na wygaśnięcie porzuconego claimu
     if (claimHeld) {
       await prisma.gradingSession
         .update({ where: { id: sessionId }, data: { status: 'in_progress' } })
         .catch((releaseError: unknown) => {
-          console.error('Failed to release session claim:', releaseError);
+          console.error('Nie udało się zwolnić blokady sesji:', releaseError);
         });
     }
 
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -1372,7 +1707,7 @@ export async function processSessionWithAI(req: Request, res: Response): Promise
 export async function getGradingSession(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -1412,14 +1747,14 @@ export async function getGradingSession(req: Request, res: Response): Promise<vo
     });
 
     if (!session) {
-      res.status(404).json({ error: 'Session not found' });
+      res.status(404).json({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
       return;
     }
 
     res.json({ session });
   } catch (error) {
-    console.error('Get grading session error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania sesji sprawdzania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -1433,7 +1768,7 @@ export async function getGradingSession(req: Request, res: Response): Promise<vo
 export async function getGradingSessionProgress(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -1456,8 +1791,8 @@ export async function getGradingSessionProgress(req: Request, res: Response): Pr
 
     res.json({ status: session.status, total_count, processed_count });
   } catch (error) {
-    console.error('Get grading session progress error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania postępu sesji:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -1557,7 +1892,7 @@ type GradeUpdateData = {
 export async function getGradingSessions(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -1664,8 +1999,8 @@ export async function getGradingSessions(req: Request, res: Response): Promise<v
 
     res.json({ sessions: summaries, total_count });
   } catch (error) {
-    console.error('Get grading sessions error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd pobierania listy sesji sprawdzania:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -1677,7 +2012,7 @@ export async function getGradingSessions(req: Request, res: Response): Promise<v
 export async function updateGrade(req: Request, res: Response): Promise<void> {
   try {
     if (!req.user) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
       return;
     }
 
@@ -1925,8 +2260,8 @@ export async function updateGrade(req: Request, res: Response): Promise<void> {
 
     res.json({ grade: updated });
   } catch (error) {
-    console.error('Update grade error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd zapisu poprawek oceny:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }
 
@@ -2044,7 +2379,7 @@ async function applyVariantChoice(
 
     res.json({ grade: updated, variant_name: match.name, regraded: true });
   } catch (error) {
-    console.error(`Re-grade after variant choice failed for grade ${grade.id}:`, error);
+    console.error(`Nie udało się przeliczyć pracy ${grade.id} po wskazanym wariancie:`, error);
 
     // Wskazany wariant zostaje w bazie i żadna strona nie schodzi z salda: praca jest gotowa do
     // sprawdzenia bez ponownej klasyfikacji, więc wystarczy zwykłe „Sprawdź prace".

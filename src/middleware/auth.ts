@@ -45,14 +45,14 @@ export async function authMiddleware(
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'No token provided' });
+      res.status(401).json({ error: 'No token provided', code: 'TOKEN_MISSING' });
       return;
     }
 
     const token = authHeader.substring(7); // Usuń "Bearer "
     decoded = verifyToken(token);
   } catch (error) {
-    res.status(401).json({ error: 'Invalid or expired token' });
+    res.status(401).json({ error: 'Invalid or expired token', code: 'TOKEN_INVALID' });
     return;
   }
 
@@ -72,7 +72,7 @@ export async function authMiddleware(
     });
 
     if (!account) {
-      res.status(401).json({ error: 'Invalid or expired token' });
+      res.status(401).json({ error: 'Invalid or expired token', code: 'TOKEN_INVALID' });
       return;
     }
 
@@ -86,7 +86,7 @@ export async function authMiddleware(
 
     next();
   } catch (error) {
-    console.error('Auth middleware error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Błąd w middleware autoryzacji:', error);
+    res.status(500).json({ error: 'Internal server error', code: 'INTERNAL_ERROR' });
   }
 }

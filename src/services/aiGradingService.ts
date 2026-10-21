@@ -670,7 +670,7 @@ async function callClaude(imagePath: string, answerKey: any, tier: ModelTier = '
   // Logowanie użycia cache
   const usage = message.usage;
   console.log(
-    `📊 Claude usage: input=${usage.input_tokens}, cache_read=${usage.cache_read_input_tokens || 0}, cache_create=${usage.cache_creation_input_tokens || 0}, output=${usage.output_tokens}, model=${model}, tier=${tier}`
+    `📊 Użycie Claude: input=${usage.input_tokens}, cache_read=${usage.cache_read_input_tokens || 0}, cache_create=${usage.cache_creation_input_tokens || 0}, output=${usage.output_tokens}, model=${model}, tier=${tier}`
   );
 
   if (message.stop_reason === 'max_tokens') {
@@ -681,7 +681,7 @@ async function callClaude(imagePath: string, answerKey: any, tier: ModelTier = '
 
   const parsed = message.parsed_output;
   if (!parsed || !validateModelOutput(parsed)) {
-    console.error('❌ Claude output does not match grading schema:', JSON.stringify(parsed));
+    console.error('❌ Wynik Claude nie pasuje do schematu oceny:', JSON.stringify(parsed));
     throw new Error('Claude returned output that does not match the grading schema');
   }
 
@@ -735,7 +735,7 @@ async function callGPT4o(imagePath: string, answerKey: any): Promise<AIGradingRe
   }
 
   if (!validateModelOutput(raw)) {
-    console.error('❌ GPT-4o output does not match grading schema:', responseText);
+    console.error('❌ Wynik GPT-4o nie pasuje do schematu oceny:', responseText);
     throw new Error('GPT-4o returned output that does not match the grading schema');
   }
 
@@ -756,7 +756,7 @@ export async function gradeWithHybridAI(
   imagePath: string,
   answerKey: any
 ): Promise<{ result: AIGradingResult; model_used: string; escalated: boolean }> {
-  console.log('🤖 Starting hybrid AI grading...');
+  console.log('🤖 Startuje hybrydowe sprawdzanie prac...');
 
   let result: AIGradingResult;
   let modelUsed = MODELS.fast.model;
@@ -764,55 +764,55 @@ export async function gradeWithHybridAI(
 
   try {
     // FAZA 1: Spróbuj z fast model (Claude Haiku)
-    console.log(`📡 Calling ${MODELS.fast.model} (fast tier)...`);
+    console.log(`📡 Wywołuję ${MODELS.fast.model} (szybsza warstwa)...`);
     result = await callClaude(imagePath, answerKey, 'fast');
 
-    console.log(`📊 Confidence score from ${MODELS.fast.model}: ${result.confidence_score}`);
+    console.log(`📊 Pewność z modelu ${MODELS.fast.model}: ${result.confidence_score}`);
 
     // FAZA 2: Sprawdź wyliczoną pewność
     if (result.confidence_score < CONFIDENCE_THRESHOLD) {
-      console.log(`⚠️ Derived confidence ${result.confidence_score} < ${CONFIDENCE_THRESHOLD} — shaky: ${shakyTasks(result)}`);
-      console.log(`🔄 Escalating to premium model: ${MODELS.premium.model}...`);
+      console.log(`⚠️ Wywiedziona pewność ${result.confidence_score} < ${CONFIDENCE_THRESHOLD} — wątpliwe zadania: ${shakyTasks(result)}`);
+      console.log(`🔄 Eskaluję do modelu premium: ${MODELS.premium.model}...`);
 
       try {
         // Eskaluj do Claude Sonnet
         const premiumResult = await callClaude(imagePath, answerKey, 'premium');
 
-        console.log(`📊 Confidence score from ${MODELS.premium.model}: ${premiumResult.confidence_score}`);
+        console.log(`📊 Pewność z modelu ${MODELS.premium.model}: ${premiumResult.confidence_score}`);
 
         // Użyj wyniku z premium modelu
         result = premiumResult;
         modelUsed = MODELS.premium.model;
         escalated = true;
 
-        console.log('✅ Escalation successful, using premium result');
+        console.log('✅ Eskalacja udana, biorę wynik modelu premium');
       } catch (escalationError) {
-        console.error('❌ Premium model failed:', escalationError);
-        console.log('⚠️ Falling back to fast model result');
+        console.error('❌ Model premium nie dał rady:', escalationError);
+        console.log('⚠️ Wracam do wyniku szybszej warstwy');
         // Zostań przy wyniku z fast modelu
       }
     } else {
-      console.log(`✅ High confidence (${result.confidence_score} >= ${CONFIDENCE_THRESHOLD}), using fast model result`);
+      console.log(`✅ Duża pewność (${result.confidence_score} >= ${CONFIDENCE_THRESHOLD}), biorę wynik szybszej warstwy`);
     }
   } catch (fastError) {
-    console.error('❌ Fast model (Claude Haiku) failed:', fastError);
+    console.error('❌ Szybsza warstwa (Claude Haiku) nie dała rady:', fastError);
 
     // FALLBACK: Spróbuj Claude Sonnet jako backup
     try {
-      console.log('🔄 Trying premium model as fallback...');
+      console.log('🔄 Próbuję modelu premium jako zapasu...');
       result = await callClaude(imagePath, answerKey, 'premium');
       modelUsed = MODELS.premium.model;
       escalated = true;
-      console.log('✅ Premium fallback successful');
+      console.log('✅ Zapasowy model premium zadziałał');
     } catch (claudeError) {
-      console.error('❌ Premium model (Claude Sonnet) also failed:', claudeError);
+      console.error('❌ Model premium (Claude Sonnet) też nie dał rady:', claudeError);
 
       // LAST RESORT: GPT-4o
-      console.log('🔄 Trying GPT-4o as last resort...');
+      console.log('🔄 Próbuję GPT-4o jako ostatniego zapasu...');
       result = await callGPT4o(imagePath, answerKey);
       modelUsed = 'gpt-4o';
       escalated = true;
-      console.log('✅ GPT-4o fallback successful');
+      console.log('✅ Zapasowe GPT-4o zadziałało');
     }
   }
 
@@ -1033,7 +1033,7 @@ export async function detectVariantFromImage(imagePath: string, variants: Varian
     });
 
     console.log(
-      `🔎 Variant detection usage: input=${message.usage.input_tokens}, cache_read=${
+      `🔎 Użycie przy rozpoznawaniu wariantu: input=${message.usage.input_tokens}, cache_read=${
         message.usage.cache_read_input_tokens || 0
       }, output=${message.usage.output_tokens}`
     );
@@ -1044,7 +1044,7 @@ export async function detectVariantFromImage(imagePath: string, variants: Varian
 
     parsed = message.parsed_output as { variant?: string; confidence?: number } | null;
   } catch (error) {
-    console.error('❌ Variant detection call failed:', error);
+    console.error('❌ Wywołanie rozpoznawania wariantu nieudane:', error);
     return { ok: false, reason: 'api_error', message: 'Wywołanie rozpoznania wariantu nie powiodło się' };
   }
 
@@ -1059,7 +1059,7 @@ export async function detectVariantFromImage(imagePath: string, variants: Varian
   const match = variantResolver(variants)(parsed.variant);
 
   if (!match) {
-    console.warn('⚠️ Variant detection returned an unmatchable name:', parsed.variant);
+    console.warn('⚠️ Rozpoznawanie wariantu zwróciło nazwę spoza klucza:', parsed.variant);
     return { ok: false, reason: 'unresolved', message: `Model podał nazwę niepasującą do żadnego wariantu: ${parsed.variant.trim()}` };
   }
 
